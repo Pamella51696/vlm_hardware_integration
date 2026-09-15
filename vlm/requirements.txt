@@ -1,0 +1,12 @@
+fastapi>=0.110
+uvicorn>=0.27
+python-multipart>=0.0.9
+pillow>=10.0
+numpy>=1.24
+opencv-python-headless>=4.8,<5
+pydantic>=2.0
+# Optional on the Orin (install the JetPack-matched wheel, not a random PyPI CUDA build):
+# torch
+# transformers>=4.40
+# accelerate
+# bitsandbytes
