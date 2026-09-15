@@ -33,8 +33,8 @@ import org.opencv.videoio.Videoio;
 public class VideoStreamingServer {
  
     private static final int DEFAULT_PORT = 9090;
-    private static final int PANEL_WIDTH  = 640;
-    private static final int PANEL_HEIGHT = 400;
+    static final int PANEL_WIDTH  = 640;
+    static final int PANEL_HEIGHT = 400;
     /** Row of the common world horizon (fraction from the top). */
     private static final double HORIZON_FRACTION = 0.40;
     /** Horizontal field of each spherical panel (deg). >90 leaves overlap. */
@@ -88,13 +88,23 @@ private static final double FISHEYE_CY = 0.50;
         }
         loadFfmpegPlugin();
  
+        FrameBuffer frameBuffer = new FrameBuffer();
+        CaptureEngine capture = new CaptureEngine(videos, frameBuffer);
+        capture.start();
+        VLMClient vlmClient = new VLMClient();
+ 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.createContext("/stitch", new StitchHandler(videos));
+        server.createContext("/stitch", new StitchHandler(frameBuffer));
         server.createContext("/play",   new PlayerPageHandler());
-        server.setExecutor(Executors.newFixedThreadPool(4));
+        server.createContext("/ask",    new AskHandler(frameBuffer, vlmClient));
+        server.createContext("/health", new HealthHandler(frameBuffer, vlmClient));
+        server.createContext("/frame",  new LatestFrameHandler(frameBuffer));
+        server.setExecutor(Executors.newFixedThreadPool(6));
         server.start();
  
         System.out.println("Server started  ->  http://localhost:" + port + "/play");
+        System.out.println("VLM queries     ->  POST http://localhost:" + port + "/ask");
+        System.out.println("VLM service     ->  " + System.getenv().getOrDefault("VLM_URL", "http://127.0.0.1:8088"));
         for (int i = 0; i < CAM_ROLE.length; i++) {
             System.out.println("  " + CAM_ROLE[i] + " = " + videos[i]
                     + "  yaw=" + CAM_YAW_DEG[i]
@@ -157,8 +167,8 @@ private static final double FISHEYE_CY = 0.50;
     }
  
     private static class StitchHandler implements HttpHandler {
-        private final Path[] videoFiles;
-        StitchHandler(Path[] f) { this.videoFiles = f; }
+        private final FrameBuffer buffer;
+        StitchHandler(FrameBuffer buffer) { this.buffer = buffer; }
  
         @Override public void handle(HttpExchange ex) throws IOException {
             if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
@@ -166,60 +176,68 @@ private static final double FISHEYE_CY = 0.50;
                 return;
             }
  
-            VideoCapture[] caps = new VideoCapture[videoFiles.length];
-            for (int i = 0; i < videoFiles.length; i++) {
-                caps[i] = openVideo(videoFiles[i]);
-                if (caps[i] == null || !caps[i].isOpened()) {
-                    System.err.println("Could not open video: " + videoFiles[i]);
-                    ex.sendResponseHeaders(500, -1);
-                    return;
-                }
-            }
- 
-            SphericalPanel[] panels = new SphericalPanel[videoFiles.length];
-            for (int i = 0; i < panels.length; i++) {
-                panels[i] = new SphericalPanel(i);
-            }
- 
-            int overlap = panelOverlapPx();
             ex.getResponseHeaders().set("Content-Type",
                     "multipart/x-mixed-replace; boundary=frame");
             ex.sendResponseHeaders(200, 0);
  
+            long lastId = -1;
             try (OutputStream out = ex.getResponseBody()) {
-                Mat[] frames = new Mat[videoFiles.length];
-                Mat[] ready  = new Mat[videoFiles.length];
-                for (int i = 0; i < videoFiles.length; i++) {
-                    frames[i] = new Mat();
-                    ready[i]  = new Mat();
-                }
- 
                 while (true) {
-                    boolean allReady = true;
-                    for (int i = 0; i < caps.length; i++) {
-                        if (!readOrLoop(caps, i, videoFiles[i], frames[i])) {
-                            allReady = false;
-                            continue;
-                        }
-                        panels[i].project(frames[i], ready[i]);
-                        if (ready[i].empty()
-                                || ready[i].cols() != PANEL_WIDTH
-                                || ready[i].rows() != PANEL_HEIGHT) {
-                            allReady = false;
-                        }
+                    FrameBuffer.Snapshot snap;
+                    try {
+                        snap = buffer.waitForNext(lastId, 2000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
                     }
-                    if (!allReady) {
+                    if (snap == null || snap.panoramaJpeg == null || snap.frameId == lastId) {
                         continue;
                     }
-                    Mat panorama = featherStitch(ready, overlap);
-                    writeFrame(out, encodeJpeg(panorama));
-                    panorama.release();
-                }
-            } finally {
-                for (VideoCapture c : caps) {
-                    if (c != null) c.release();
+                    lastId = snap.frameId;
+                    writeFrame(out, snap.panoramaJpeg);
                 }
             }
+        }
+    }
+
+    private static class LatestFrameHandler implements HttpHandler {
+        private final FrameBuffer buffer;
+        LatestFrameHandler(FrameBuffer buffer) { this.buffer = buffer; }
+
+        @Override public void handle(HttpExchange ex) throws IOException {
+            FrameBuffer.Snapshot snap = buffer.peek();
+            if (snap == null || snap.panoramaJpeg == null) {
+                ex.sendResponseHeaders(503, -1);
+                return;
+            }
+            ex.getResponseHeaders().set("Content-Type", "image/jpeg");
+            ex.getResponseHeaders().set("Cache-Control", "no-store");
+            ex.sendResponseHeaders(200, snap.panoramaJpeg.length);
+            try (OutputStream os = ex.getResponseBody()) {
+                os.write(snap.panoramaJpeg);
+            }
+        }
+    }
+
+    private static class HealthHandler implements HttpHandler {
+        private final FrameBuffer buffer;
+        private final VLMClient vlm;
+        HealthHandler(FrameBuffer buffer, VLMClient vlm) {
+            this.buffer = buffer;
+            this.vlm = vlm;
+        }
+
+        @Override public void handle(HttpExchange ex) throws IOException {
+            FrameBuffer.Snapshot snap = buffer.peek();
+            boolean frame = snap != null;
+            boolean vlmUp = vlm.healthy();
+            String json = "{\"capture\":" + frame
+                    + ",\"frame_id\":" + (frame ? snap.frameId : 0)
+                    + ",\"vlm\":" + vlmUp + "}";
+            byte[] bytes = json.getBytes("UTF-8");
+            ex.getResponseHeaders().set("Content-Type", "application/json; charset=UTF-8");
+            ex.sendResponseHeaders(200, bytes.length);
+            try (OutputStream os = ex.getResponseBody()) { os.write(bytes); }
         }
     }
  
@@ -234,7 +252,6 @@ private static final double FISHEYE_CY = 0.50;
                 + "html, body { height: 100%; background: #0a0a0f; color: #e0e0e0;"
                 + "  font-family: 'Segoe UI', sans-serif; overflow: hidden; }"
                 + ".container { display: flex; flex-direction: column;"
-                + "  align-items: center; justify-content: center;"
                 + "  height: 100vh; padding: 16px; gap: 12px; }"
                 + "h1 { font-size: 1.25rem; font-weight: 300; letter-spacing: 1px;"
                 + "  color: #7ec8e3; text-align: center; flex-shrink: 0; }"
@@ -242,13 +259,64 @@ private static final double FISHEYE_CY = 0.50;
                 + "  border: 1px solid #2a2a3a; border-radius: 8px; overflow: hidden;"
                 + "  display: flex; align-items: center; justify-content: center; }"
                 + ".pano-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }"
+                + ".ask-bar { flex-shrink: 0; display: flex; flex-wrap: wrap; gap: 8px;"
+                + "  align-items: stretch; }"
+                + ".ask-bar input { flex: 1; min-width: 180px; padding: 10px 12px;"
+                + "  border-radius: 6px; border: 1px solid #2a2a3a; background: #14141c;"
+                + "  color: #e0e0e0; font-size: 0.95rem; }"
+                + ".ask-bar button { padding: 10px 16px; border: 0; border-radius: 6px;"
+                + "  background: #2a6f8f; color: #fff; cursor: pointer; font-size: 0.95rem; }"
+                + ".ask-bar button:disabled { opacity: 0.5; cursor: wait; }"
+                + ".chips { display: flex; flex-wrap: wrap; gap: 6px; }"
+                + ".chips button { background: #1c1c28; color: #7ec8e3; border: 1px solid #2a2a3a;"
+                + "  border-radius: 999px; padding: 6px 10px; font-size: 0.8rem; cursor: pointer; }"
+                + "pre { flex-shrink: 0; max-height: 28vh; overflow: auto; background: #12121a;"
+                + "  border: 1px solid #2a2a3a; border-radius: 8px; padding: 10px;"
+                + "  font-size: 0.82rem; color: #c8e6c9; white-space: pre-wrap; }"
                 + "</style></head><body>"
                 + "<div class='container'>"
-                + "  <h1>common vehicle horizon</h1>"
+                + "  <h1>common vehicle horizon + VLM query</h1>"
                 + "  <div class='pano-wrap'>"
                 + "    <img src='/stitch' alt='stitched panorama'>"
                 + "  </div>"
-                + "</div></body></html>";
+                + "  <div class='chips'>"
+                + "    <button type='button' data-q='Is there a curb on the left side?'>curb left</button>"
+                + "    <button type='button' data-q='Is the road clear?'>road clear</button>"
+                + "    <button type='button' data-q='Is there a pedestrian?'>pedestrian</button>"
+                + "    <button type='button' data-q='Is there a car on the right?'>car right</button>"
+                + "    <button type='button' data-q='Is there an obstacle ahead?'>obstacle</button>"
+                + "  </div>"
+                + "  <form class='ask-bar' id='ask-form'>"
+                + "    <input id='query' name='query' placeholder='Ask about the current calibrated frame…' value='Is there a curb on the left side?'>"
+                + "    <button id='ask-btn' type='submit'>Ask VLM</button>"
+                + "  </form>"
+                + "  <pre id='answer'>VLM answers appear here as structured JSON.\\nStart vlm/server.py on port 8088, then ask a question. The live stream stays at camera rate; the VLM only runs on submit.</pre>"
+                + "</div>"
+                + "<script>"
+                + "const form=document.getElementById('ask-form');"
+                + "const input=document.getElementById('query');"
+                + "const btn=document.getElementById('ask-btn');"
+                + "const out=document.getElementById('answer');"
+                + "document.querySelectorAll('.chips button').forEach(b=>{"
+                + "  b.addEventListener('click',()=>{input.value=b.getAttribute('data-q');});"
+                + "});"
+                + "form.addEventListener('submit', async (e)=>{"
+                + "  e.preventDefault();"
+                + "  const query=input.value.trim();"
+                + "  if(!query) return;"
+                + "  btn.disabled=true;"
+                + "  out.textContent='Asking VLM…';"
+                + "  try {"
+                + "    const r=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},"
+                + "      body:JSON.stringify({query})});"
+                + "    const t=await r.text();"
+                + "    try { out.textContent=JSON.stringify(JSON.parse(t),null,2); }"
+                + "    catch(_){ out.textContent=t; }"
+                + "  } catch(err) { out.textContent=String(err); }"
+                + "  btn.disabled=false;"
+                + "});"
+                + "</script>"
+                + "</body></html>";
             byte[] bytes = html.getBytes("UTF-8");
             ex.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
             ex.sendResponseHeaders(200, bytes.length);
