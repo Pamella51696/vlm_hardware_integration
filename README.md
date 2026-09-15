@@ -5,9 +5,18 @@ scene questions on the *current undistorted frame only* — not every video fram
          ├─ /stitch  (display, camera rate)
          └─ POST /ask → Python VLM (on demand) → JSON
 
-Run the VLM service first:
+On Windows, keep **two** terminals open:
 
-    bash scripts/run_vlm.sh
+    cd vlm
+    py -m pip install -r requirements.txt
+    py server.py
+
+Leave that window running (Uvicorn on http://127.0.0.1:8088). Then start Java.
+If the Python prompt comes back, the VLM process died — start `py server.py` again.
+
+GET http://localhost:9090/ask?query=Is%20there%20a%20pedestrian%3F works once
+Java has a frame and Python is up. Opening Python http://127.0.0.1:8088/ask in
+the browser only checks that the service is alive; it has no camera image.
 
 Then compile and start the Java server the same way you already do, with every
 `.java` file on the javac line, for example:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Tuple
 
 import cv2
@@ -10,6 +11,12 @@ import numpy as np
 
 _HOG = None
 _HOG_FAILED = False
+
+
+def hog_enabled() -> bool:
+    # Off by default: HOG on a stitched panorama often native-crashes OpenCV
+    # on Windows and kills uvicorn, which then looks like "connection refused".
+    return os.environ.get("VLM_USE_HOG", "0") == "1"
 
 
 def _hog():
@@ -22,9 +29,18 @@ def _hog():
 
 def people_boxes(bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
     global _HOG, _HOG_FAILED
+    if not hog_enabled():
+        return []
     h, w = bgr.shape[:2]
     if h < 80 or w < 40:
         return []
+    # Downscale first so detectMultiScale cannot explode on a 360 panorama.
+    max_side = 320
+    scale = 1.0
+    small = bgr
+    if max(h, w) > max_side:
+        scale = max_side / float(max(h, w))
+        small = cv2.resize(bgr, (max(1, int(w * scale)), max(1, int(h * scale))))
     if _HOG is None and not _HOG_FAILED:
         try:
             _HOG = _hog()
@@ -35,18 +51,25 @@ def people_boxes(bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
             return []
     if _HOG is None:
         return []
-    rects, weights = _HOG.detectMultiScale(
-        bgr, winStride=(8, 8), padding=(8, 8), scale=1.05
-    )
+    try:
+        rects, weights = _HOG.detectMultiScale(
+            small, winStride=(8, 8), padding=(8, 8), scale=1.05
+        )
+    except Exception:
+        _HOG_FAILED = True
+        return []
+    inv = 1.0 / scale if scale else 1.0
     boxes = []
     for (x, y, bw, bh), weight in zip(rects, weights):
         if float(weight) < 0.4:
             continue
-        boxes.append((int(x), int(y), int(bw), int(bh)))
+        boxes.append((int(x * inv), int(y * inv), int(bw * inv), int(bh * inv)))
     return boxes
 
 
 def hog_available() -> bool:
+    if not hog_enabled():
+        return False
     if _HOG is not None:
         return True
     if _HOG_FAILED:

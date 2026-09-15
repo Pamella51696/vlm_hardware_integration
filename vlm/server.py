@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -36,6 +36,28 @@ def health():
     }
 
 
+@app.get("/ask")
+def ask_get(query: str = Query("", description="Question about the scene")):
+    """Browser-friendly check. Real answers still need an image via POST or Java /ask."""
+    if not query.strip():
+        return JSONResponse(
+            {
+                "ok": True,
+                "hint": "GET /ask?query=... only checks that the service is up. "
+                "Use the Java /play page (POST) so a camera frame is attached.",
+            }
+        )
+    return JSONResponse(
+        {
+            "error": "image required",
+            "query": query.strip(),
+            "hint": "This Python process has no camera. Open Java http://localhost:9090/play "
+            "and click Ask VLM, or POST multipart image+query to /ask.",
+        },
+        status_code=400,
+    )
+
+
 @app.post("/ask")
 async def ask(
     query: str = Form(...),
@@ -50,15 +72,26 @@ async def ask(
         return JSONResponse({"error": "empty image"}, status_code=400)
     if not query.strip():
         return JSONResponse({"error": "empty query"}, status_code=400)
-    result = engine.answer(
-        image_bytes=raw,
-        query=query.strip(),
-        frame_id=frame_id,
-        roi=roi,
-        category=category,
-        hint=hint,
-    )
-    return JSONResponse(result)
+    try:
+        result = engine.answer(
+            image_bytes=raw,
+            query=query.strip(),
+            frame_id=frame_id,
+            roi=roi,
+            category=category,
+            hint=hint,
+        )
+        return JSONResponse(result)
+    except Exception as exc:
+        return JSONResponse(
+            {
+                "answer": "unknown",
+                "object": "scene",
+                "error": str(exc),
+                "description": "Query failed inside the VLM service; process stayed up.",
+            },
+            status_code=200,
+        )
 
 
 def main() -> None:

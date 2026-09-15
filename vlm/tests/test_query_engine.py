@@ -37,6 +37,18 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(_asked_side("curb on the left", "full"), "left")
         self.assertEqual(_asked_side("anything", "right"), "right")
 
+    def test_pedestrian_does_not_crash(self):
+        import cv2
+        import numpy as np
+
+        img = np.full((400, 1920, 3), 30, dtype=np.uint8)
+        ok, buf = cv2.imencode(".jpg", img)
+        self.assertTrue(ok)
+        engine = QueryEngine(backend=None)
+        result = engine.answer(buf.tobytes(), "Is there a pedestrian?")
+        self.assertEqual(result["object"], "pedestrian")
+        self.assertIn(result["answer"], {"yes", "no", "unknown"})
+
     def test_synthetic_blank_frame(self):
         import cv2
         import numpy as np

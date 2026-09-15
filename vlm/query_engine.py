@@ -36,7 +36,10 @@ class QueryEngine:
         hint: str = "",
     ) -> Dict[str, Any]:
         bgr = resize_max_side(decode_bgr(image_bytes))
-        prior = self._priors(bgr, query, roi)
+        try:
+            prior = self._priors(bgr, query, roi)
+        except Exception as exc:
+            prior = fallback(query, f"opencv prior failed: {exc}")
         vlm_raw = None
         vlm_text = ""
         if self._backend is not None:
@@ -98,8 +101,12 @@ class QueryEngine:
                         "object": "pedestrian",
                         "status": "unknown",
                         "count": 0,
-                        "confidence": 0.2,
-                        "description": "HOG pedestrian detector is not in this OpenCV build; enable a VLM backend.",
+                        "confidence": 0.25,
+                        "description": (
+                            "Pedestrian questions need a VLM backend "
+                            "(set VLM_BACKEND=transformers). Hybrid mode does not run HOG "
+                            "on the panorama because it can crash the Python process."
+                        ),
                     }
                 )
 

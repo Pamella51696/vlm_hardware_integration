@@ -28,14 +28,18 @@ public final class AskHandler implements HttpHandler {
             ex.sendResponseHeaders(204, -1);
             return;
         }
-        if (!"POST".equalsIgnoreCase(ex.getRequestMethod())) {
-            send(ex, 405, jsonError("method not allowed"));
+        if (!"POST".equalsIgnoreCase(ex.getRequestMethod())
+                && !"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+            send(ex, 405, jsonError("Use POST /ask or GET /ask?query=..."));
             return;
         }
-        String body = readBody(ex);
+        String body = "GET".equalsIgnoreCase(ex.getRequestMethod()) ? "" : readBody(ex);
         String query = extractJsonString(body, "query");
         if (query == null || query.trim().isEmpty()) {
             query = extractForm(body, "query");
+        }
+        if (query == null || query.trim().isEmpty()) {
+            query = queryParam(ex, "query");
         }
         if (query == null || query.trim().isEmpty()) {
             send(ex, 400, jsonError("missing query"));
@@ -66,14 +70,19 @@ public final class AskHandler implements HttpHandler {
                     category, hint);
             send(ex, 200, response);
         } catch (IOException e) {
-            send(ex, 502, jsonError("VLM service unavailable: " + e.getMessage()));
+            send(ex, 502, jsonError(
+                    "Python VLM is not running on 127.0.0.1:8088. "
+                    + "Keep a second terminal open: cd vlm && py server.py. "
+                    + "Do not close it after startup. Detail: " + e.getMessage()));
+        } catch (Exception e) {
+            send(ex, 500, jsonError("ask failed: " + e.getMessage()));
         }
     }
 
     static void addCors(HttpExchange ex) {
         ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
         ex.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type");
-        ex.getResponseHeaders().set("Access-Control-Allow-Methods", "POST, OPTIONS");
+        ex.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     }
 
     static String readBody(HttpExchange ex) throws IOException {
@@ -139,6 +148,14 @@ public final class AskHandler implements HttpHandler {
             }
         }
         return sb.toString();
+    }
+
+    static String queryParam(HttpExchange ex, String key) {
+        String raw = ex.getRequestURI().getRawQuery();
+        if (raw == null || raw.isEmpty()) {
+            return null;
+        }
+        return extractForm(raw, key);
     }
 
     static String extractForm(String body, String key) {
